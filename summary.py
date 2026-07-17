@@ -127,11 +127,104 @@ def render(sessions: list[Session], unit: str, show_sets: bool, use_colour: bool
     return "\n".join(out)
 
 
+def agent_payload(s: Session, unit: str) -> dict:
+    """JSON twin of render_for_agent.
+
+    Built by hand rather than via asdict() so the derived per-hand fields are present:
+    they're the whole point, and a consumer shouldn't have to rediscover them from
+    capacity ratios.
+    """
+    return {
+        "workout": s.title,
+        "source": "Speediance Gym Monster",
+        "finished_at": s.finished_at.isoformat(sep=" ") if s.finished_at else None,
+        "date": str(s.day),
+        "duration_min": s.duration_min,
+        "calories": s.calories,
+        "volume": s.volume,
+        "unit": unit,
+        "exercises": [
+            {
+                "name": e.name,
+                "per_side": e.per_side,
+                "load_points": e.load_points,
+                "sets": [
+                    {
+                        "reps": st.reps,
+                        "target_reps": st.target_reps,
+                        "weight": st.top_weight,
+                        "weight_total": st.total_weight,
+                        "side": {1: "left", 2: "right"}.get(st.side, "both"),
+                    }
+                    for st in e.sets
+                ],
+            }
+            for e in s.loaded_exercises
+        ],
+        "unweighted": [e.name for e in s.exercises if not e.is_loaded],
+    }
+
+
+def render_for_agent(s: Session, unit: str) -> str:
+    """A dense, unambiguous digest of one session, for pasting into an AI agent.
+
+    Deliberately plain: no colour, no PR/score noise, and every load spelled out so the
+    agent never has to infer whether a weight is per-hand or total.
+    """
+    out: list[str] = []
+    when = s.finished_at.strftime("%Y-%m-%d %H:%M") if s.finished_at else str(s.day)
+    out.append(f"Workout: {s.title} (Speediance Gym Monster)")
+    out.append(f"Finished: {when} ({s.day:%a %d %b %Y})")
+    out.append(f"Duration: {s.duration_min} min | Calories: {s.calories} kcal | Volume: {_fmt(s.volume)} {unit}")
+
+    loaded = s.loaded_exercises
+    if not loaded:
+        out.append("")
+        out.append("No weighted exercises recorded for this session.")
+        return "\n".join(out)
+
+    if any(e.per_side for e in loaded):
+        out.append(
+            "Note: dual-handle moves report the load in EACH hand; the total moved is given "
+            "in brackets. Log whichever your tracker expects, but don't double-count."
+        )
+    out.append("")
+    out.append(f"Exercises ({len(loaded)}), weights in {unit}:")
+
+    for i, e in enumerate(loaded, 1):
+        parts = []
+        for st in e.sets:
+            side = {1: " (left)", 2: " (right)"}.get(st.side, "")
+            if e.per_side:
+                load = f"{_fmt(st.top_weight)} {unit}/hand ({_fmt(st.total_weight)} {unit} total)"
+            else:
+                load = f"{_fmt(st.top_weight)} {unit}"
+            parts.append(f"{st.reps} reps @ {load}{side}")
+        out.append(f"{i}. {e.name} — {len(e.sets)} set{'s' if len(e.sets) != 1 else ''}: " + "; ".join(parts))
+
+    skipped = [e.name for e in s.exercises if not e.is_loaded]
+    if skipped:
+        out.append("")
+        out.append("Unweighted (warm-up/mobility): " + ", ".join(skipped))
+    return "\n".join(out)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Summarise recent Gym Monster workouts.")
     parser.add_argument("--days", type=int, default=14, help="days back to include (default 14)")
     parser.add_argument("--sets", action="store_true", help="show a per-set breakdown")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of text")
+    parser.add_argument(
+        "--last",
+        action="store_true",
+        help="just the most recent workout, as a concise digest to feed an AI agent",
+    )
+    parser.add_argument(
+        "--lookback",
+        type=int,
+        default=90,
+        help="with --last, how many days back to hunt for the most recent workout (default 90)",
+    )
     parser.add_argument("--region", default=os.environ.get("GM_REGION", "EU"), choices=["EU", "Global"])
     args = parser.parse_args()
 
@@ -142,19 +235,39 @@ def main() -> int:
         return 2
 
     client = Speediance(email, password, region=args.region)
+    until = date.today()
+    window = args.lookback if args.last else args.days
+    since = until - timedelta(days=window - 1)
     try:
         client.login()
-        until = date.today()
-        sessions = client.recent_sessions(until - timedelta(days=args.days - 1), until)
+        # For --last, skip detail on the whole window: we only need one session's exercises.
+        sessions = client.recent_sessions(since, until, with_detail=not args.last)
     except SpeedianceError as exc:
         print(f"Speediance API: {exc}", file=sys.stderr)
         return 1
+
+    if args.last:
+        if not sessions:
+            print(f"No completed workouts in the last {window} days.", file=sys.stderr)
+            return 1
+        # recent_sessions sorts oldest-first, so the most recent is last.
+        latest = sessions[-1]
+        try:
+            latest.exercises = client.session_detail(latest.training_id, latest.type)
+        except SpeedianceError as exc:
+            print(f"Speediance API: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(agent_payload(latest, client.unit), indent=2, default=str))
+        else:
+            print(render_for_agent(latest, client.unit))
+        return 0
 
     if args.json:
         payload = {
             "account": email,
             "unit": client.unit,
-            "from": str(until - timedelta(days=args.days - 1)),
+            "from": str(since),
             "to": str(until),
             "sessions": [asdict(s) for s in sessions],
         }

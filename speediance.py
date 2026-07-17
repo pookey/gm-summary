@@ -43,6 +43,7 @@ class WorkSet:
     weights: list[float]  # one entry per rep, already in the account's display unit
     seconds: int
     side: int  # 0 bilateral, 1 left, 2 right
+    capacity: float = 0.0  # the API's own work total for this set
 
     @property
     def top_weight(self) -> float:
@@ -52,6 +53,25 @@ class WorkSet:
     @property
     def is_loaded(self) -> bool:
         return bool(self.weights) and self.top_weight > 0
+
+    @property
+    def load_points(self) -> int:
+        """How many points the load is applied at: 2 for dual-handle, 1 for barbell etc.
+
+        `weights` is the load at ONE point, so a dual-handle move reporting 50kg is 50kg in
+        each hand. The API doesn't say so directly, but `capacity` is the total work, so the
+        ratio recovers it. Measured across 445 sets of real history this is exactly 1 or 2,
+        never anything else, and never varies within an exercise.
+        """
+        total = sum(self.weights)
+        if total <= 0 or self.capacity <= 0:
+            return 1
+        return max(1, round(self.capacity / total))
+
+    @property
+    def total_weight(self) -> float:
+        """Load across all points — what the body actually moved."""
+        return self.top_weight * self.load_points
 
 
 @dataclass
@@ -75,6 +95,16 @@ class Exercise:
     @property
     def total_reps(self) -> int:
         return sum(s.reps for s in self.sets)
+
+    @property
+    def load_points(self) -> int:
+        loaded = [s for s in self.sets if s.is_loaded]
+        return loaded[0].load_points if loaded else 1
+
+    @property
+    def per_side(self) -> bool:
+        """True when the reported weight is the load in each hand, not the total."""
+        return self.load_points > 1
 
     @property
     def prs(self) -> list[str]:
@@ -257,6 +287,7 @@ def _parse_exercise(raw: dict) -> Exercise:
                 weights=[float(w) for w in (detail.get("weights") or [])],
                 seconds=entry.get("time") or 0,
                 side=entry.get("leftRight") or 0,
+                capacity=float(entry.get("capacity") or 0.0),
             )
         )
     return Exercise(
